@@ -1,2 +1,2 @@
 # jypyternotebook
-consist of all jupyternotebook algos
+consist of all jupyternotebook algorithms
