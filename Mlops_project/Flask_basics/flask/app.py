@@ -37,6 +37,11 @@ def successloop(score):
     exp = {"res":res,"score":score}
     return render_template("./loop_result.html", expression=exp)
 
+# 3) conditions  with variables 
+@app.route("/successif/<int:score>")
+def successif(score):    
+    return render_template("./if_result.html",score=score)
+
 
 if __name__=="__main__":
     app.run(debug=True)

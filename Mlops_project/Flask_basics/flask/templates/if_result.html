@@ -1,0 +1,14 @@
+<html><h1>Looping through the given dictionary</h1>
+<body>
+    <table border="2px">
+
+    {% if score >= 50  %}    
+        <tr>{{ score }}</tr>
+        <td>passed</td>
+    {% else %}
+        <tr>{{ score }}</tr>
+        <td>failed</td>
+    {% endif %}
+
+    </table>
+</body></html>
