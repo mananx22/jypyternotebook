@@ -13,6 +13,13 @@ def form():
         return f" Welcome {name}, how are you"
     else:
         return render_template("form.html")
+    
+## jinja .py
+# 1) variable rule 
+@app.route("/success/<int:score>")
+def success(score):
+    return "you have received" + str(score)
+
 
 if __name__=="__main__":
     app.run(debug=True)
