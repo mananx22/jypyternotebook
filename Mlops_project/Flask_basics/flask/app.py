@@ -1,4 +1,4 @@
-from flask import Flask,render_template,request
+from flask import Flask,render_template,request,redirect,url_for
 
 app=Flask(__name__)
 
@@ -41,6 +41,18 @@ def successloop(score):
 @app.route("/successif/<int:score>")
 def successif(score):    
     return render_template("./if_result.html",score=score)
+
+# 4. dynamic url
+@app.route("/getresults", methods=['GET','POST'])
+def getresults():
+    if request.method=='POST':
+        science = int(request.form['science'])
+        maths = int(request.form['maths'])
+        history = int(request.form['history'])
+        total = (science+maths+history)/3
+        return redirect(url_for('successloop', score=total ))    
+    else:
+        return render_template("dynamic_result.html")
 
 
 if __name__=="__main__":
