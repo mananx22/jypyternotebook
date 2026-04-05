@@ -18,7 +18,13 @@ def form():
 # 1) variable rule 
 @app.route("/success/<int:score>")
 def success(score):
-    return "you have received" + str(score)
+    res = ""
+    if score > 50:
+        res = "Passed"
+    else:
+        res = "failed"
+
+    return render_template('results.html', results=res, scr=score)
 
 
 if __name__=="__main__":
