@@ -6,7 +6,8 @@ from src.logger import logging  # Recorder that writes what happened to a file
 import pandas as pd  # Tool for handling data in spreadsheets (pd is a shortcut)
 from sklearn.model_selection import train_test_split  # Tool that cuts data into training and testing pieces
 from dataclasses import dataclass  # Decorator that auto-makes constructors for simple data-holder classes
-
+from src.components.data_transformation import Datatransformation
+from src.components.data_transformation import DatatransformationConfig
 # Config class - a simple box that holds three file paths
 # Think of it as labels: "where to save training data", "where to save test data", "where to save raw data"
 @dataclass
@@ -61,9 +62,14 @@ class DataIngestion:
             raise CustomException(e,sys)
         
     
-# Main block - only runs if this file is executed directly (not imported)
+# Run the pipeline only when this file is executed directly.
 if __name__=="__main__":
-    # Create a DataIngestion object
+    # Create the ingestion object.
     obj = DataIngestion()
-    # Call its method to run the entire pipeline
-    obj.initiatedataingestion()
+
+    # Split the raw data into train and test files.
+    train_data,test_data = obj.initiatedataingestion()
+
+    # Transform the split data and save the preprocessor.
+    data_transformation = Datatransformation()
+    data_transformation.initiate_datatransformation(train_data,test_data)
