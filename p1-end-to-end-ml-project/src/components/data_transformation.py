@@ -1,188 +1,251 @@
-# Preprocess the student performance dataset into model-ready features.
-# Save the fitted transformer so training and inference use the same steps.
+"""
+Data Transformation Module
+==========================
+This module handles the entire feature-engineering / preprocessing stage of the
+student-performance ML pipeline.  It sits between data ingestion (which produces
+raw train/test CSVs) and model training (which expects clean NumPy arrays).
 
-# Access the active exception details when wrapping errors.
+Responsibilities:
+    1. Define *which* columns are numeric vs. categorical.
+    2. Build a scikit-learn ColumnTransformer that applies the right pipeline
+       to each column group (imputation → encoding/scaling).
+    3. Fit the transformer on the training set and apply it to both splits,
+       ensuring no data leakage from test into train.
+    4. Persist the fitted transformer as a .pkl artifact so that the exact
+       same preprocessing can be replayed at inference time.
+
+Flow:
+    artifacts/train.csv ──►  fit_transform  ──►  train_arr (NumPy array)
+    artifacts/test.csv  ──►  transform      ──►  test_arr  (NumPy array)
+                                            ──►  artifacts/preprocessor.pkl (fitted transformer)
+"""
+
 import sys
-
-# Create a lightweight container for configuration values.
+import os
 from dataclasses import dataclass
 
-# Join transformed features with the target values.
 import numpy as np
-
-# Read the train and test CSV files.
 import pandas as pd
 
-# Apply different transforms to different columns.
 from sklearn.compose import ColumnTransformer
-
-# Fill in missing values before scaling or encoding.
 from sklearn.impute import SimpleImputer
-
-# Chain preprocessing steps together.
 from sklearn.pipeline import Pipeline
-
-# Encode categories and scale numeric data.
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-# Raise project-specific errors with context.
 from src.exception import CustomException
-
-# Write progress messages to the project log.
 from src.logger import logging
-
-# Save fitted objects to disk.
 from src.utils import save_obj
 
-# Build filesystem paths for artifacts.
-import os
 
-
-# Turn the configuration container into a dataclass.
-# Keep the artifact path in one dedicated place.
+# ---------------------------------------------------------------------------
+# DataTransformationConfig
+# ---------------------------------------------------------------------------
+# A lightweight dataclass that centralises every path / constant the
+# transformation step needs.  Right now the only value is the output
+# location for the fitted preprocessor, but keeping it in a dataclass
+# makes it trivial to extend later (e.g. add a path for a feature-list
+# JSON, or a flag to toggle scaling on/off).
+# ---------------------------------------------------------------------------
 @dataclass
-class DatatransformationConfig:
-    # Save the fitted preprocessor in the artifacts folder.
-    preprocessor_obj_file_path = os.path.join("artifacts", "preprocessor.pkl")
+class DataTransformationConfig:
+    # The fitted ColumnTransformer will be serialised (pickled) to this path.
+    # Other components (model trainer, prediction pipeline) load this same
+    # file so that new data is transformed identically to the training data.
+    preprocessor_file_path: str = os.path.join("artifacts", "preprocessor.pkl")
 
 
-# Build and run the preprocessing workflow.
-# Fit preprocessing on the train split and reuse it for the test split.
-class Datatransformation():
-    # Initialize the transformer with its configuration.
-    # Keep artifact paths available on the instance.
+# ---------------------------------------------------------------------------
+# DataTransformation
+# ---------------------------------------------------------------------------
+# Core class that wires together the preprocessing logic.
+#
+# Usage (called from the training pipeline):
+#     transformer = DataTransformation()
+#     train_arr, test_arr, pkl_path = transformer.initiate_data_transformation(
+#         train_path="artifacts/train.csv",
+#         test_path="artifacts/test.csv",
+#     )
+#
+# The returned arrays have the structure:
+#     [transformed_features ... | target_column]
+# so they can be sliced directly into X and y for model training.
+# ---------------------------------------------------------------------------
+class DataTransformation:
+
     def __init__(self):
-        # Create the config object for this transformer.
-        self.datatransformationconfig = DatatransformationConfig()
+        # Instantiate the config dataclass and store it on the instance
+        # so every method can access artifact paths via self.config.
+        self.config = DataTransformationConfig()
 
-    # Build the column-wise preprocessing pipeline.
-    # Return a reusable transformer for numeric and categorical features.
-    def get_data_transformer_object(self):
-        # Start guarded construction so errors can be wrapped consistently.
+    # -----------------------------------------------------------------------
+    # get_preprocessor
+    # -----------------------------------------------------------------------
+    # Builds and returns a sklearn ColumnTransformer that applies separate
+    # pipelines to numeric and categorical columns.
+    #
+    # Numeric pipeline (applied to reading_score, writing_score):
+    #   Step 1 – SimpleImputer(strategy="median")
+    #       Replaces missing values with the column median.  Median is chosen
+    #       over mean because exam scores can have outliers (e.g. a few zeros)
+    #       that would skew the mean.
+    #   Step 2 – StandardScaler()
+    #       Centres each column to mean=0 and std=1.  Many algorithms
+    #       (linear regression, SVMs, gradient-based methods) converge faster
+    #       and perform better on standardised features.
+    #
+    # Categorical pipeline (applied to gender, race_ethnicity, etc.):
+    #   Step 1 – SimpleImputer(strategy="most_frequent")
+    #       Fills missing categories with the mode (most common value).
+    #   Step 2 – OneHotEncoder()
+    #       Converts each categorical value into a binary column.  This is
+    #       necessary because most ML models cannot consume string labels
+    #       directly; one-hot encoding avoids imposing a false ordinal
+    #       relationship between categories.
+    #
+    # Returns:
+    #     sklearn.compose.ColumnTransformer – unfitted preprocessor object.
+    # -----------------------------------------------------------------------
+    def get_preprocessor(self):
         try:
-            # List the numeric columns that will be scaled.
-            numerical_columns = [
-                # Scale the reading score feature.
-                "reading_score",
-                # Scale the writing score feature.
-                "writing_score",
-            ]
-            # List the categorical columns that will be one-hot encoded.
-            cat_columns = [
-                # Encode the gender feature.
+            # --- Define column groups ----------------------------------------
+            # These lists must match the column names present in the CSV files
+            # produced by the data-ingestion step.  If the dataset schema
+            # changes, update these lists accordingly.
+            numerical_features = ["reading_score", "writing_score"]
+            categorical_features = [
                 "gender",
-                # Encode the race and ethnicity feature.
                 "race_ethnicity",
-                # Encode the parental education feature.
                 "parental_level_of_education",
-                # Encode the lunch feature.
                 "lunch",
-                # Encode the test preparation feature.
                 "test_preparation_course",
             ]
 
-            # Create the pipeline for numeric columns.
-            num_pipeline = Pipeline(
-                # Define the ordered numeric preprocessing steps.
+            # --- Numeric pipeline --------------------------------------------
+            # Median imputation is robust to outliers; StandardScaler then
+            # normalises each feature to zero mean and unit variance.
+            numerical_pipeline = Pipeline(
                 steps=[
-                    # Fill missing numeric values with the median.
                     ("imputer", SimpleImputer(strategy="median")),
-                    # Standardize numeric values.
                     ("scaler", StandardScaler()),
                 ]
             )
 
-            # Create the pipeline for categorical columns.
-            cat_pipeline = Pipeline(
-                # Define the ordered categorical preprocessing steps.
+            # --- Categorical pipeline ----------------------------------------
+            # Mode imputation preserves the most common category; OneHotEncoder
+            # converts each category into a sparse binary vector.
+            categorical_pipeline = Pipeline(
                 steps=[
-                    # Fill missing categories with the most common value.
                     ("imputer", SimpleImputer(strategy="most_frequent")),
-                    # Convert categories to one-hot encoded features.
                     ("one_hot_encoder", OneHotEncoder()),
                 ]
             )
 
-            # Note that the numeric and categorical encoders are ready.
-            logging.info("Categorical and numerical encoding completed")
+            logging.info("Numerical and categorical pipelines constructed.")
 
-            # Combine the numeric and categorical pipelines.
-            preprocessor = ColumnTransformer([
-                # Apply the numeric pipeline to numeric columns.
-                ("numerical_pipeline", num_pipeline, numerical_columns),
-                # Apply the categorical pipeline to categorical columns.
-                ("categorical_pipeline", cat_pipeline, cat_columns),
-            ])
+            # --- Combine into a single ColumnTransformer ---------------------
+            # ColumnTransformer routes each column to the correct pipeline
+            # based on the feature lists above.  Columns not listed in either
+            # list are dropped by default (remainder="drop").
+            preprocessor = ColumnTransformer(
+                [
+                    ("numerical_pipeline", numerical_pipeline, numerical_features),
+                    ("categorical_pipeline", categorical_pipeline, categorical_features),
+                ]
+            )
 
-            # Return the configured preprocessing object.
             return preprocessor
+
         except Exception as e:
+            # Wrap the raw exception in CustomException so the project-wide
+            # error handler can attach file name and line number context.
             raise CustomException(e, sys)
 
-    # Load split data, transform features, and save the fitted preprocessor.
-    # Return the transformed arrays and the saved artifact path.
-    def initiate_datatransformation(self, train_path, test_path):
-        # Start guarded execution so data issues are wrapped consistently.
+    # -----------------------------------------------------------------------
+    # initiate_data_transformation
+    # -----------------------------------------------------------------------
+    # End-to-end method that:
+    #   1. Reads the train and test CSV files from the paths supplied by the
+    #      data-ingestion component.
+    #   2. Separates input features (X) from the target column (y = math_score).
+    #   3. Fits the preprocessor on X_train only (to avoid data leakage),
+    #      then transforms both X_train and X_test.
+    #   4. Re-attaches the target column to each transformed array so the
+    #      model trainer receives a single array per split.
+    #   5. Serialises the fitted preprocessor to disk (as a .pkl file) so
+    #      the prediction pipeline can reuse the exact same transformation.
+    #
+    # Args:
+    #     train_path (str): Absolute or relative path to the training CSV.
+    #     test_path  (str): Absolute or relative path to the test CSV.
+    #
+    # Returns:
+    #     tuple: (train_arr, test_arr, preprocessor_file_path)
+    #         - train_arr (np.ndarray): Transformed training data with target
+    #           as the last column.
+    #         - test_arr  (np.ndarray): Transformed test data with target
+    #           as the last column.
+    #         - preprocessor_file_path (str): Path where the fitted
+    #           preprocessor was saved.
+    # -----------------------------------------------------------------------
+    def initiate_data_transformation(self, train_path, test_path):
         try:
-            # Read the training split into a dataframe.
+            # --- 1. Load the raw CSV splits ----------------------------------
+            # These CSVs were written by the data-ingestion step and contain
+            # all original columns including the target (math_score).
             train_df = pd.read_csv(train_path)
-            # Read the test split into a dataframe.
             test_df = pd.read_csv(test_path)
-            # Confirm both files were loaded.
-            logging.info("train and test data read completed")
-            # Note that the preprocessing object is about to be built.
-            logging.info("obtaining preprocessor object")
-            # Build the preprocessing pipeline.
-            preprocessing_obj = self.get_data_transformer_object()
+            logging.info("Train and test datasets loaded successfully.")
 
-            # Identify the target column.
-            target_col_name = "math_score"
-            # Keep the numeric feature names available locally.
-            numerical_columns = ["reading_score", "writing_score"]
-            # Remove the target column from the training features.
-            input_feature_train_df = train_df.drop(columns=[target_col_name], axis=1)
-            # Extract the training target values.
-            target_feature_train_df = train_df[target_col_name]
+            # --- 2. Build the preprocessor -----------------------------------
+            # The preprocessor is an unfitted ColumnTransformer; it will be
+            # fitted on the training features in step 4 below.
+            logging.info("Building preprocessor object.")
+            preprocessor = self.get_preprocessor()
 
-            # Remove the target column from the test features.
-            input_feature_test_df = test_df.drop(columns=[target_col_name], axis=1)
-            # Extract the test target values.
-            target_feature_test_df = test_df[target_col_name]
+            # --- 3. Separate features (X) from target (y) --------------------
+            # The target variable is "math_score" — this is what the model
+            # will learn to predict.  Everything else is an input feature.
+            target_column = "math_score"
 
-            # Note that transformation is about to run.
-            logging.info("applying preprocessing on training and test dtaset")
+            X_train = train_df.drop(columns=[target_column], axis=1)
+            y_train = train_df[target_column]
 
-            # Fit on the training features and transform them.
-            input_feature_train_arr = preprocessing_obj.fit_transform(input_feature_train_df)
-            # Transform the test features with the fitted pipeline.
-            input_feature_test_Arr = preprocessing_obj.transform(input_feature_test_df)
+            X_test = test_df.drop(columns=[target_column], axis=1)
+            y_test = test_df[target_column]
 
-            # Combine transformed training features with the training target.
-            train_arr = np.c_[
-                # Convert the target series to a NumPy array before joining.
-                input_feature_train_arr, np.array(target_feature_train_df)
-            ]
+            # --- 4. Fit on train, transform both splits ----------------------
+            # fit_transform learns statistics (medians, modes, means, stds)
+            # from X_train and applies the transformation in one pass.
+            # transform on X_test reuses the *same* learned statistics so there
+            # is no data leakage from the test set.
+            logging.info("Applying preprocessor to training and test datasets.")
+            X_train_arr = preprocessor.fit_transform(X_train)
+            X_test_arr = preprocessor.transform(X_test)
 
-            # Combine transformed test features with the test target.
-            test_arr = np.c_[
-                # Convert the target series to a NumPy array before joining.
-                input_feature_test_Arr, np.array(target_feature_test_df)
-            ]
+            # --- 5. Re-attach the target column ------------------------------
+            # np.c_ column-stacks the transformed features with the target
+            # so the model trainer can simply slice arr[:, :-1] for X and
+            # arr[:, -1] for y.
+            train_arr = np.c_[X_train_arr, np.array(y_train)]
+            test_arr = np.c_[X_test_arr, np.array(y_test)]
 
-            # Record that the fitted pipeline will be saved.
-            logging.info("saved preprocessing objects")
-
-            # Persist the fitted preprocessor to disk.
-            save_obj(file_path=self.datatransformationconfig.preprocessor_obj_file_path, obj=preprocessing_obj)
-
-            # Return the transformed data and artifact path.
-            return(
-                # Provide the transformed training data.
-                train_arr,
-                # Provide the transformed test data.
-                test_arr,
-                # Provide the saved artifact path.
-                self.datatransformationconfig.preprocessor_obj_file_path,
+            # --- 6. Persist the fitted preprocessor --------------------------
+            # Saving the fitted object ensures the prediction pipeline applies
+            # the identical transformation (same medians, modes, scaler params)
+            # that was learned during training.
+            logging.info("Saving fitted preprocessor object to disk.")
+            save_obj(
+                file_path=self.config.preprocessor_file_path,
+                obj=preprocessor,
             )
+
+            return (
+                train_arr,
+                test_arr,
+                self.config.preprocessor_file_path,
+            )
+
         except Exception as e:
+            # Wrap and re-raise so the project-wide error handler captures
+            # the full traceback with file and line number context.
             raise CustomException(e, sys)
