@@ -21,6 +21,7 @@ from sklearn.model_selection import train_test_split
 from dataclasses import dataclass
 from src.components.data_transformation import DataTransformation
 from src.components.data_transformation import DataTransformationConfig
+from src.components.model_trainer import ModelTrainer,ModelTrainerConfig
 
 
 # ---------------------------------------------------------------------------
@@ -127,3 +128,45 @@ if __name__=="__main__":
 
     data_transformation = DataTransformation()
     data_transformation.initiate_data_transformation(train_data,test_data)
+
+    train_arr,test_arr,_ = data_transformation.initiate_data_transformation(train_data,test_data)
+    
+    ModelTrainer = ModelTrainer()
+    print(ModelTrainer.initiate_model_trainer(train_arr,test_arr))
+
+
+# ---------------------------------------------------------------------------
+# Example prediction flow
+# ---------------------------------------------------------------------------
+# This is how the saved artifacts are used later during inference.
+#
+# Steps:
+#   1. Load preprocessor.pkl to transform raw input data.
+#   2. Load model.pkl to make the final prediction.
+#   3. Pass the transformed features into the trained model.
+#
+# Example:
+#     import dill
+#     import pandas as pd
+#
+#     with open("artifacts/preprocessor.pkl", "rb") as file_obj:
+#         preprocessor = dill.load(file_obj)
+#
+#     with open("artifacts/model.pkl", "rb") as file_obj:
+#         model = dill.load(file_obj)
+#
+#     input_df = pd.DataFrame([{
+#         "gender": "female",
+#         "race_ethnicity": "group B",
+#         "parental_level_of_education": "bachelor's degree",
+#         "lunch": "standard",
+#         "test_preparation_course": "completed",
+#         "reading_score": 72,
+#         "writing_score": 74,
+#     }])
+#
+#     processed_input = preprocessor.transform(input_df)
+#     prediction = model.predict(processed_input)
+#     print(prediction[0])
+
+
