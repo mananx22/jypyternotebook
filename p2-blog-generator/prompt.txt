@@ -1,0 +1,183 @@
+================================================================================
+PROJECT: p2-blog-generator — AI Blog Generation API
+================================================================================
+
+A FastAPI-based REST API that uses LangGraph and Groq LLM (LLaMA 3.1 8B) to
+automatically generate blog posts (title + content) from a given topic.
+
+================================================================================
+HIGH-LEVEL WORKFLOW
+================================================================================
+
+1. Client sends a POST request to /blogs with a JSON body: {"topic": "..."}
+2. The API initializes a Groq LLM connection.
+3. A LangGraph StateGraph is built with two processing nodes:
+     Node 1: "title creation"  → generates a creative blog title from the topic
+     Node 2: "content_generation" → generates ~70 lines of blog content from the topic
+4. The graph executes sequentially: START → title creation → content_generation → END
+5. The final state (containing topic, blog title, and blog content) is returned as JSON.
+
+Execution flow:
+  Client POST /blogs  →  app.py (FastAPI route)
+                       →  Groqllm.get_llm() initializes ChatGroq
+                       →  Graphbuilder.setup_graph("topic") builds the graph
+                       →  BlogNode.title_creation() generates the title
+                       →  BlogNode.content_gen() generates the body
+                       →  Final BlogState returned to client
+
+================================================================================
+FILE-BY-FILE BREAKDOWN
+================================================================================
+
+--- app.py (Root) -------------------------------------------------------------
+Entry point for the FastAPI web server. Defines API routes.
+
+  • Imports & Setup:
+      - Loads environment variables from .env via python-dotenv.
+      - Creates a FastAPI app instance.
+      - Sets the LANGSMITH_API_KEY environment variable from LANGCHAIN_API_KEY
+        (used for LangSmith tracing/monitoring).
+
+  • POST /blogs — create_blogs(request):
+      1. Parses the incoming JSON body and extracts the "topic" field.
+      2. Creates a Groqllm instance and calls get_llm() to get a ChatGroq object.
+      3. Creates a Graphbuilder with the LLM and calls setup_graph(usecase="topic")
+         to get the configured LangGraph StateGraph.
+      4. Invokes the graph with the initial state {"topic": topic}.
+      5. Returns the final state as {"Data": state}.
+
+--- main.py (Root) -----------------------------------------------------------
+A simple placeholder entry point. Prints a greeting when run directly.
+Not used in the API workflow.
+
+================================================================================
+src/ MODULES
+================================================================================
+
+--- src/__init__.py -----------------------------------------------------------
+Marks the src/ directory as a Python package.
+
+--- src/llms/groqllm.py ------------------------------------------------------
+Wrapper around the Groq LLM API using langchain-groq.
+
+  class Groqllm:
+    • __init__():
+        - Calls load_dotenv() to load environment variables from a .env file.
+
+    • get_llm():
+        - Reads the GROQ_API_KEY from environment variables.
+        - Sets it in os.environ for the Groq SDK to use.
+        - Creates and returns a ChatGroq instance using:
+            • model: "llama-3.1-8b-instant" (fast, lightweight LLaMA variant)
+            • api_key: wrapped in Pydantic's SecretStr for secure handling
+        - Raises a ValueError if initialization fails.
+
+--- src/states/blogstate.py --------------------------------------------------
+Defines the data models (state schema) used throughout the graph.
+
+  class Blog (BaseModel):
+    • title (str): The generated blog title.
+    • content (str): The generated blog body text.
+
+  class BlogState (TypedDict):
+    • topic (str): The input topic provided by the user.
+    • blog (Blog): A Blog object holding the title and content.
+    • current_state (str): A string tracking the current processing state.
+
+--- src/nodes/blog_node.py ---------------------------------------------------
+Contains the actual processing logic for each step in the blog generation
+pipeline. Each method receives the current BlogState, calls the LLM, and
+returns a partial state update that LangGraph merges into the shared state.
+
+  class BlogNode:
+    • __init__(llm):
+        - Stores the LLM instance for use by both node methods.
+
+    • title_creation(state: BlogState) -> dict:
+        - Validates that state["topic"] exists and is non-empty.
+        - Constructs a prompt asking the LLM (acting as an expert news reporter)
+          to generate a creative blog title for the given topic.
+        - Calls llm.invoke(prompt) and extracts response.content.
+        - Returns {"blog": {"title": "<generated title>"}}.
+          LangGraph merges this into the shared state.
+
+    • content_gen(state: BlogState) -> dict:
+        - Constructs a prompt asking the LLM (acting as an expert blog writer)
+          to generate a detailed ~70-line blog post for the given topic.
+        - Calls llm.invoke(prompt) and extracts response.content.
+        - Returns {"blog": {"title": state["blog"].title, "content": "<generated content>"}}.
+          This preserves the title from the previous node and adds the content.
+
+--- src/graphs/graph_builder.py ----------------------------------------------
+Constructs and configures the LangGraph StateGraph that orchestrates the
+blog generation workflow.
+
+  class Graphbuilder:
+    • __init__(llm):
+        - Stores the LLM instance.
+        - Creates a new StateGraph with BlogState as the state schema.
+
+    • build_topic_graph() -> StateGraph:
+        1. Creates a BlogNode instance with the stored LLM.
+        2. Adds two nodes to the graph:
+             "title creation"     → BlogNode.title_creation
+             "content_generation" → BlogNode.content_gen
+        3. Adds three edges defining the execution order:
+             START → "title creation"
+             "title creation" → "content_generation"
+             "content_generation" → END
+        4. Returns the configured StateGraph (needs .compile() before use).
+
+    • setup_graph(usecase) -> StateGraph | None:
+        - Dispatcher that selects the graph to build based on the usecase string.
+        - If usecase == "topic", calls build_topic_graph().
+        - ⚠️ BUG: Missing `return` before self.build_topic_graph(), so this
+          method always returns None. Fix: change to `return self.build_topic_graph()`.
+
+--- src/graphs/graph_builder_commented.py ------------------------------------
+A fully annotated copy of graph_builder.py with detailed line-by-line
+explanations. For documentation/reference only; not used at runtime.
+
+================================================================================
+DATA FLOW THROUGH THE GRAPH
+================================================================================
+
+  Initial state:    {"topic": "AI in healthcare", "blog": ..., "current_state": ...}
+        │
+        ▼
+  ┌─────────────────────┐
+  │  "title creation"   │  BlogNode.title_creation()
+  │  Input:  topic      │  → Calls LLM with title-generation prompt
+  │  Output: blog.title │  → Returns {"blog": {"title": "..."}}
+  └─────────┬───────────┘
+            │
+            ▼
+  ┌──────────────────────────┐
+  │  "content_generation"    │  BlogNode.content_gen()
+  │  Input:  topic, title    │  → Calls LLM with content-generation prompt
+  │  Output: blog.content    │  → Returns {"blog": {"title": "...", "content": "..."}}
+  └─────────┬────────────────┘
+            │
+            ▼
+  Final state: {"topic": "AI in healthcare", "blog": {"title": "...", "content": "..."},
+                "current_state": ...}
+
+================================================================================
+ENVIRONMENT VARIABLES REQUIRED
+================================================================================
+
+  GROQ_API_KEY       — API key for Groq Cloud (LLM access)
+  LANGCHAIN_API_KEY  — API key for LangSmith (tracing/monitoring)
+
+================================================================================
+KNOWN ISSUES
+================================================================================
+
+  1. setup_graph() in graph_builder.py is missing a `return` statement,
+     causing it to always return None.
+  2. The graph returned by build_topic_graph() is not compiled before .invoke()
+     is called in app.py. LangGraph requires graph.compile() before execution.
+  3. Groqllm.get_llm() has a string formatting bug: f-string is missing the 'f'
+     prefix — "Error occured : {e}" should be f"Error occured : {e}".
+  4. content_gen() in blog_node.py accesses state["blog"].title directly, which
+     will fail if title_creation didn't run or returned None.
