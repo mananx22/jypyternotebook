@@ -46,4 +46,4 @@ class BlogState(TypedDict):
 
     topic: str
     blog: Blog
-    current_state: str
+    current_language: str

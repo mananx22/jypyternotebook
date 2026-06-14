@@ -119,6 +119,38 @@ class Graphbuilder:
         # Compilation validates the graph structure and prepares it for execution.
         return self.graph
 
+    def build_language_graph(self):
+        self.blog_node_obj = BlogNode(self.llm)
+
+        self.graph.add_node("title_creation", self.blog_node_obj.title_creation)
+        self.graph.add_node("content_generation", self.blog_node_obj.content_gen)
+        self.graph.add_node("hindi_translation", lambda state: self.blog_node_obj.translation({ **state, "current_language": "hindi"}))
+        self.graph.add_node("french_translation", lambda state: self.blog_node_obj.translation({ **state, "current_lanugage": "french"}))
+        self.graph.add_node("route", self.blog_node_obj.route)
+
+
+
+        self.graph.add_edge(START, "title_creation")
+        self.graph.add_edge("title_creation", "content_generation")
+        self.graph.add_edge("content_generation", "route")
+
+        # conditional edge
+        self.graph.add_conditional_edges(
+            "route",
+            self.blog_node_obj.route_decision,
+                {
+                    "hindi" : "hindi_translation",
+                    "french" : "french_translation"
+
+                }      
+        )
+        self.graph.add_edge("hindi_translation", END)
+        self.graph.add_edge("french_translation", END)
+        return self.graph
+
+
+
+    
     def setup_graph(self, usecase):
         # """
         # A factory/dispatcher method that selects and builds the appropriate
@@ -144,6 +176,8 @@ class Graphbuilder:
         if usecase == "topic":
             # Build and return the topic blog generation graph.
             self.build_topic_graph()
+        if usecase == "language":
+            self.build_language_graph()
         return self.graph.compile()
 
 # below code is for langsmith, langgraph studio.
