@@ -1,7 +1,7 @@
 **/.env
 .env
 .venv
-.vscode
+
 __pycache__
 .langgraph_api
 deactivate
