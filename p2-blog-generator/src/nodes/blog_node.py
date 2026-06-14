@@ -48,4 +48,4 @@ class BlogNode():
                 "title": state["blog"]["title"],
                 "content": response.content,
             }
-        }
+        } 

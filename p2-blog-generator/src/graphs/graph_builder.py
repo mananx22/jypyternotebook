@@ -145,3 +145,8 @@ class Graphbuilder:
             # Build and return the topic blog generation graph.
             self.build_topic_graph()
         return self.graph.compile()
+
+# below code is for langsmith, langgraph studio.
+llm = Groqllm().get_llm()
+graph_builder = Graphbuilder(llm)
+graph=graph_builder.build_topic_graph().compile()
