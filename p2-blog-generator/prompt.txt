@@ -3,26 +3,35 @@ PROJECT: p2-blog-generator — AI Blog Generation API
 ================================================================================
 
 A FastAPI-based REST API that uses LangGraph and Groq LLM (LLaMA 3.1 8B) to
-automatically generate blog posts (title + content) from a given topic.
+automatically generate blog posts (title + content) from a given topic, with
+optional translation to Hindi or French via a conditional routing workflow.
 
 ================================================================================
 HIGH-LEVEL WORKFLOW
 ================================================================================
 
-1. Client sends a POST request to /blogs with a JSON body: {"topic": "..."}
+1. Client sends a POST request to /blogs with JSON body:
+   {"topic": "...", "language": "..."}
 2. The API initializes a Groq LLM connection.
-3. A LangGraph StateGraph is built with two processing nodes:
-     Node 1: "title creation"  → generates a creative blog title from the topic
-     Node 2: "content_generation" → generates ~70 lines of blog content from the topic
-4. The graph executes sequentially: START → title creation → content_generation → END
-5. The final state (containing topic, blog title, and blog content) is returned as JSON.
+3. A LangGraph StateGraph is built based on the use case:
+     • "language" use case (currently active):
+         Nodes: title_creation → content_generation → route → (hindi_translation | french_translation)
+         Uses conditional edges to select the translation node based on language.
+     • "topic" use case (currently commented out in app.py):
+         Nodes: title creation → content_generation
+         Simple sequential flow without translation.
+4. The graph is compiled and invoked with the initial state.
+5. The final state (containing topic, blog, and current_language) is returned as JSON.
 
-Execution flow:
+Execution flow (language use case):
   Client POST /blogs  →  app.py (FastAPI route)
                        →  Groqllm.get_llm() initializes ChatGroq
-                       →  Graphbuilder.setup_graph("topic") builds the graph
+                       →  Graphbuilder.setup_graph("language") builds & compiles the graph
                        →  BlogNode.title_creation() generates the title
                        →  BlogNode.content_gen() generates the body
+                       →  BlogNode.route() passes through current_language
+                       →  BlogNode.route_decision() selects "hindi" or "french"
+                       →  BlogNode.translation() translates content via structured output
                        →  Final BlogState returned to client
 
 ================================================================================
@@ -39,16 +48,28 @@ Entry point for the FastAPI web server. Defines API routes.
         (used for LangSmith tracing/monitoring).
 
   • POST /blogs — create_blogs(request):
-      1. Parses the incoming JSON body and extracts the "topic" field.
+      1. Parses the incoming JSON body and extracts "topic" and "language" fields.
       2. Creates a Groqllm instance and calls get_llm() to get a ChatGroq object.
-      3. Creates a Graphbuilder with the LLM and calls setup_graph(usecase="topic")
-         to get the configured LangGraph StateGraph.
-      4. Invokes the graph with the initial state {"topic": topic}.
-      5. Returns the final state as {"Data": state}.
+      3. Creates a Graphbuilder with the LLM.
+      4. If both topic and language are provided:
+           - Calls setup_graph(usecase="language") to build & compile the language graph.
+           - Invokes the graph with {"topic": topic, "current_language": language.lower()}.
+      5. (Commented out) If only topic is provided:
+           - Would call setup_graph(usecase="topic") for topic-only generation.
+      6. Returns the final state as {"data": state}.
+
+  • Note: Server runs via uvicorn on 0.0.0.0:8000 with hot-reload when run directly.
 
 --- main.py (Root) -----------------------------------------------------------
 A simple placeholder entry point. Prints a greeting when run directly.
 Not used in the API workflow.
+
+--- langgraph.json (Root) ----------------------------------------------------
+LangGraph Studio / API configuration file.
+  • "dependencies": ["."] — project root as dependency.
+  • "graphs": maps "graph_generator" to ./src/graphs/graph_builder.py:graph
+    (the module-level compiled graph instance).
+  • "env": "./.env" — points to the environment file.
 
 ================================================================================
 src/ MODULES
@@ -76,13 +97,13 @@ Wrapper around the Groq LLM API using langchain-groq.
 Defines the data models (state schema) used throughout the graph.
 
   class Blog (BaseModel):
-    • title (str): The generated blog title.
-    • content (str): The generated blog body text.
+    • title (str): The generated blog title (Field with description).
+    • content (str): The generated blog body text (Field with description).
 
   class BlogState (TypedDict):
     • topic (str): The input topic provided by the user.
     • blog (Blog): A Blog object holding the title and content.
-    • current_state (str): A string tracking the current processing state.
+    • current_language (str): The target language for translation (e.g. "hindi", "french").
 
 --- src/nodes/blog_node.py ---------------------------------------------------
 Contains the actual processing logic for each step in the blog generation
@@ -91,12 +112,13 @@ returns a partial state update that LangGraph merges into the shared state.
 
   class BlogNode:
     • __init__(llm):
-        - Stores the LLM instance for use by both node methods.
+        - Stores the LLM instance for use by all node methods.
 
     • title_creation(state: BlogState) -> dict:
         - Validates that state["topic"] exists and is non-empty.
         - Constructs a prompt asking the LLM (acting as an expert news reporter)
-          to generate a creative blog title for the given topic.
+          to generate a creative blog title (max 10 words) for the given topic.
+          Uses markdown formatting.
         - Calls llm.invoke(prompt) and extracts response.content.
         - Returns {"blog": {"title": "<generated title>"}}.
           LangGraph merges this into the shared state.
@@ -104,13 +126,35 @@ returns a partial state update that LangGraph merges into the shared state.
     • content_gen(state: BlogState) -> dict:
         - Constructs a prompt asking the LLM (acting as an expert blog writer)
           to generate a detailed ~70-line blog post for the given topic.
+          Uses markdown formatting.
         - Calls llm.invoke(prompt) and extracts response.content.
-        - Returns {"blog": {"title": state["blog"].title, "content": "<generated content>"}}.
+        - Returns {"blog": {"title": state["blog"]["title"], "content": "<generated content>"}}.
           This preserves the title from the previous node and adds the content.
+
+    • translation(state: BlogState) -> dict:
+        - Constructs a prompt asking the LLM (acting as an expert linguist of
+          the target language) to translate both the topic and blog content to
+          the specified current_language, preserving format and tone.
+        - Sends the prompt as a HumanMessage list.
+        - Uses llm.with_structured_output(Blog).invoke(message) to get a
+          structured Blog object back from the LLM.
+        - Returns {"blog": {"content": translation_content}}.
+          Note: Returns the full Blog object inside the content field.
+
+    • route(state: BlogState) -> dict:
+        - A pass-through node that simply returns {"current_language": state["current_language"]}.
+        - Used as the source node for the conditional edge in build_language_graph().
+
+    • route_decision(state: BlogState) -> str:
+        - The routing function for conditional edges.
+        - Returns "hindi" if current_language is "hindi".
+        - Returns "french" if current_language is "french".
+        - Otherwise returns the raw current_language value.
 
 --- src/graphs/graph_builder.py ----------------------------------------------
 Constructs and configures the LangGraph StateGraph that orchestrates the
-blog generation workflow.
+blog generation workflow. Includes detailed inline comments (the separate
+graph_builder_commented.py file has been merged into this file).
 
   class Graphbuilder:
     • __init__(llm):
@@ -126,27 +170,48 @@ blog generation workflow.
              START → "title creation"
              "title creation" → "content_generation"
              "content_generation" → END
-        4. Returns the configured StateGraph (needs .compile() before use).
+        4. Returns the configured StateGraph (not compiled).
 
-    • setup_graph(usecase) -> StateGraph | None:
+    • build_language_graph() -> StateGraph:
+        1. Creates a BlogNode instance with the stored LLM.
+        2. Adds five nodes to the graph:
+             "title_creation"      → BlogNode.title_creation
+             "content_generation"  → BlogNode.content_gen
+             "hindi_translation"   → Lambda wrapping BlogNode.translation with language="hindi"
+             "french_translation"  → Lambda wrapping BlogNode.translation with language="french"
+             "route"               → BlogNode.route
+        3. Adds sequential edges:
+             START → "title_creation"
+             "title_creation" → "content_generation"
+             "content_generation" → "route"
+        4. Adds a conditional edge from "route":
+             Uses BlogNode.route_decision as the routing function.
+             Maps: "hindi" → "hindi_translation", "french" → "french_translation"
+        5. Adds terminal edges:
+             "hindi_translation" → END
+             "french_translation" → END
+        6. Returns the configured StateGraph (not compiled).
+
+    • setup_graph(usecase) -> CompiledGraph:
         - Dispatcher that selects the graph to build based on the usecase string.
         - If usecase == "topic", calls build_topic_graph().
-        - ⚠️ BUG: Missing `return` before self.build_topic_graph(), so this
-          method always returns None. Fix: change to `return self.build_topic_graph()`.
+        - If usecase == "language", calls build_language_graph().
+        - Compiles and returns self.graph.compile() for either case.
 
---- src/graphs/graph_builder_commented.py ------------------------------------
-A fully annotated copy of graph_builder.py with detailed line-by-line
-explanations. For documentation/reference only; not used at runtime.
+  Module-level code (for LangGraph Studio):
+    - Creates a Groqllm instance and gets the LLM.
+    - Builds and compiles the topic graph as a module-level `graph` variable.
+    - This allows LangGraph Studio to discover and run the graph via langgraph.json.
 
 ================================================================================
-DATA FLOW THROUGH THE GRAPH
+DATA FLOW THROUGH THE GRAPH (language use case)
 ================================================================================
 
-  Initial state:    {"topic": "AI in healthcare", "blog": ..., "current_state": ...}
+  Initial state:    {"topic": "AI in healthcare", "blog": ..., "current_language": "hindi"}
         │
         ▼
   ┌─────────────────────┐
-  │  "title creation"   │  BlogNode.title_creation()
+  │  "title_creation"   │  BlogNode.title_creation()
   │  Input:  topic      │  → Calls LLM with title-generation prompt
   │  Output: blog.title │  → Returns {"blog": {"title": "..."}}
   └─────────┬───────────┘
@@ -159,8 +224,27 @@ DATA FLOW THROUGH THE GRAPH
   └─────────┬────────────────┘
             │
             ▼
-  Final state: {"topic": "AI in healthcare", "blog": {"title": "...", "content": "..."},
-                "current_state": ...}
+  ┌──────────────────────────┐
+  │  "route"                 │  BlogNode.route()
+  │  Input:  current_language│  → Pass-through, returns {"current_language": "..."}
+  └─────────┬────────────────┘
+            │
+            ▼  (conditional edge via route_decision)
+     ┌──────┴──────┐
+     │             │
+     ▼             ▼
+  ┌──────────┐  ┌──────────┐
+  │  hindi   │  │  french  │  BlogNode.translation()
+  │  transl. │  │  transl. │  → Calls LLM with structured output (Blog)
+  │          │  │          │  → Returns {"blog": {"content": <Blog>}}
+  └────┬─────┘  └────┬─────┘
+       │              │
+       ▼              ▼
+      END            END
+
+  Final state: {"topic": "AI in healthcare",
+                "blog": {"content": <translated Blog object>},
+                "current_language": "hindi"}
 
 ================================================================================
 ENVIRONMENT VARIABLES REQUIRED
@@ -168,16 +252,36 @@ ENVIRONMENT VARIABLES REQUIRED
 
   GROQ_API_KEY       — API key for Groq Cloud (LLM access)
   LANGCHAIN_API_KEY  — API key for LangSmith (tracing/monitoring)
+  LANGCHAIN_PROJECT  — LangSmith project name (set to "blog_generator")
 
 ================================================================================
 KNOWN ISSUES
 ================================================================================
 
-  1. setup_graph() in graph_builder.py is missing a `return` statement,
-     causing it to always return None.
-  2. The graph returned by build_topic_graph() is not compiled before .invoke()
-     is called in app.py. LangGraph requires graph.compile() before execution.
-  3. Groqllm.get_llm() has a string formatting bug: f-string is missing the 'f'
-     prefix — "Error occured : {e}" should be f"Error occured : {e}".
-  4. content_gen() in blog_node.py accesses state["blog"].title directly, which
-     will fail if title_creation didn't run or returned None.
+  1. Groqllm.get_llm() has a string formatting bug: the except block uses
+     "Error occured : {e}" (plain string) instead of f"Error occured : {e}"
+     (f-string). The exception details will not be interpolated.
+
+  2. content_gen() in blog_node.py accesses state["blog"]["title"] directly,
+     which will fail if title_creation didn't run or returned None.
+
+  3. translation() returns {"blog": {"content": translation_content}} where
+     translation_content is a Blog Pydantic object (from structured output),
+     not a raw string. This nests a Blog object inside the content field,
+     which may cause serialization/type issues downstream.
+
+  4. The french_translation lambda in build_language_graph() has a typo:
+     "current_lanugage" (misspelled) instead of "current_language". This means
+     the french translation node will not receive the correct language key.
+
+  5. route_decision() only handles "hindi" and "french" explicitly. Any other
+     language value is returned as-is, but there is no matching node in the
+     conditional edge map, which will cause a LangGraph routing error.
+
+  6. The topic-only code path in app.py is commented out, so the API currently
+     only works when both topic AND language are provided.
+
+  7. The title_creation node is named "title creation" (with a space) in
+     build_topic_graph() but "title_creation" (with an underscore) in
+     build_language_graph(). This inconsistency doesn't cause a runtime error
+     but may be confusing.
